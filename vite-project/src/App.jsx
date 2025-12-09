@@ -9,7 +9,14 @@ import React, {
 const API_BASE =
   import.meta.env.VITE_API_BASE || "http://localhost:5000";
 
- console.log("API_BASE in browser:", API_BASE);
+const isMobile =
+  typeof navigator !== "undefined" &&
+  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+    navigator.userAgent
+  );
+
+
+console.log("API_BASE in browser:", API_BASE);
   
 function App() {
   const [conversation, setConversation] = useState([]);
@@ -31,8 +38,9 @@ function App() {
   // STT / TTS
   const [sttSupported, setSttSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [autoSpeak, setAutoSpeak] = useState(true);
+  const [autoSpeak, setAutoSpeak] = useState(!isMobile);
   const recognitionRef = useRef(null);
+
 
   // ---- helper: build history payload for /api/simulate ----
   const buildHistory = useCallback(() => {
@@ -88,18 +96,22 @@ function App() {
       setScore(scores || null);
       setCoachTips(tips || null);
 
-      if (autoSpeak && "speechSynthesis" in window) {
-        const utter = new SpeechSynthesisUtterance(reply);
-        utter.rate = 1;
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(utter);
-      }
-    } catch (err) {
-      console.error("Error in /api/simulate:", err);
-      setError(err.message || "Error talking to simulator");
-    } finally {
-      setLoading(false);
+  if (autoSpeak && ttsReady && "speechSynthesis" in window) {
+    try {
+      const utter = new SpeechSynthesisUtterance(reply);
+      utter.rate = 1;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utter);
+    } catch (e) {
+      console.error("TTS speak failed:", e);
     }
+  }
+} catch (err) {
+  console.error("Error in /api/simulate:", err);
+  setError(err.message || "Error talking to simulator");
+} finally {
+  setLoading(false);
+}
   },
   [autoSpeak, buildHistory]
 );
@@ -612,23 +624,44 @@ function App() {
               </div>
             )}
 
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.35rem",
-                marginTop: "0.75rem",
-                cursor: "pointer",
-                fontSize: "0.8rem",
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={autoSpeak}
-                onChange={(e) => setAutoSpeak(e.target.checked)}
-              />
-              Auto-play customer voice (TTS)
-            </label>
+<button
+  type="button"
+  onClick={() => {
+    if (!("speechSynthesis" in window)) {
+      alert("Your browser does not support text-to-speech.");
+      return;
+    }
+
+    try {
+      const testUtterance = new SpeechSynthesisUtterance(
+        "Voice has been enabled for your sales trainer."
+      );
+      testUtterance.rate = 1;
+
+      testUtterance.onend = () => {
+        setTtsReady(true);
+        console.log("TTS warmed up and ready.");
+      };
+
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(testUtterance);
+    } catch (err) {
+      console.error("TTS warmup failed:", err);
+    }
+  }}
+  style={{
+    marginTop: "0.4rem",
+    padding: "0.25rem 0.6rem",
+    borderRadius: "0.375rem",
+    border: "1px solid #4b5563",
+    backgroundColor: "#111827",
+    color: "#e5e7eb",
+    fontSize: "0.75rem",
+    cursor: "pointer",
+  }}
+>
+  {ttsReady ? "Voice ready" : "Tap to enable voice"}
+</button>
 
             {coachTips && coachTips.length > 0 && (
               <div
