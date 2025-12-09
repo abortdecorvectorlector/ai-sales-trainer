@@ -6,8 +6,11 @@ import React, {
   useCallback,
 } from "react";
 
-const API_BASE = "http://localhost:5000";
+const API_BASE =
+  import.meta.env.VITE_API_BASE || "http://localhost:5000";
 
+ console.log("API_BASE in browser:", API_BASE);
+  
 function App() {
   const [conversation, setConversation] = useState([]);
   const [input, setInput] = useState("");
