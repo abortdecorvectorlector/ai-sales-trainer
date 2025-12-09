@@ -38,7 +38,8 @@ function App() {
   // STT / TTS
   const [sttSupported, setSttSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const [autoSpeak, setAutoSpeak] = useState(!isMobile);
+  const [autoSpeak] = useState(!isMobile);
+  const [ttsReady, setTtsReady] = useState(false);
   const recognitionRef = useRef(null);
 
 
@@ -113,7 +114,7 @@ function App() {
   setLoading(false);
 }
   },
-  [autoSpeak, buildHistory]
+  [autoSpeak, buildHistory, ttsReady]
 );
 
   // ---- helper: handle send (text OR STT transcript) ----
