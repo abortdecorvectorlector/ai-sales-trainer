@@ -62,6 +62,20 @@ export function getSimState() {
   return simState;
 }
 
+export function updateSimState(patch = {}) {
+  if (!simState.state) simState.state = {};
+
+  // Support both shapes:
+  // updateSimState({ trust: 0.4 })
+  // updateSimState({ state: { trust: 0.4 } })
+  const next = patch.state && typeof patch.state === "object" ? patch.state : patch;
+
+  simState.state = {
+    ...simState.state,
+    ...next,
+  };
+}
+
 /* ============================================================
    Merge update into internal state
    ============================================================ */
