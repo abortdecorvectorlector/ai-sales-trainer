@@ -1,7 +1,19 @@
+// server/index.js
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+
+import generateCustomerProfile from "./sim/generateCustomerProfile.js";
+import {
+  initializeSimState,
+  getSimState,
+  updateSimState as mergeSimState, // merges into simState.state
+  pushConversationTurn,
+  resetSimState,
+} from "./sim/simState.js";
+
+import { SimStates, CustomerIntent, updateSimState as runStateMachine } from "./sim/stateMachine.js";
 
 dotenv.config();
 
@@ -19,96 +31,23 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-function difficultyDescriptor(difficulty) {
-  switch (difficulty) {
-    case "easy":
-      return "low resistance and fairly open to being convinced if the rep builds rapport and explains clearly. If the rep gives a few strong, clear answers about your main concern, you often move toward a soft yes or a quick appointment (for example, going to check the meter or grabbing a bill).";
-    case "tough":
-      return "high resistance, naturally skeptical, and needs strong proof and trust before softening. You may soften a bit or agree to a small next step if the rep handles your main concern very well.";
-    case "nightmare":
-      return "very high resistance, time-pressed, assumes door-to-door reps are a hassle or a scam. You are hard to win; if the rep is very strong you might move from a hard no to a guarded maybe or very tentative next step, otherwise you shut it down.";
-    case "normal":
-    default:
-      return "moderate resistance, like a typical homeowner with doubts but also some curiosity. If the rep answers your key concerns clearly (cost, commitment, hassle), you can gradually become more open and sometimes agree to hear more or set an appointment.";
-  }
-}
+/* ============================================================
+   Helpers
+   ============================================================ */
+const clamp01 = (n) => {
+  const x = Number(n);
+  if (Number.isNaN(x)) return 0.5;
+  return Math.max(0, Math.min(1, x));
+};
 
-function customerTypeDescriptor(customerType) {
-  switch (customerType) {
-    case "skeptical":
-      return "skeptical and probing, asks hard questions and looks for reasons to say no, but still listens.";
-    case "busy":
-      return "busy and rushed, in the middle of something, impatient with long explanations, focused on time and getting back to what they were doing.";
-    case "friendly":
-      return "casually polite but still cautious. Will give the rep a fair shot if they are clear and quick, but still guards their time.";
-    case "hostile":
-      return "annoyed at being interrupted, defensive and quick to push back. You speak bluntly and keep your answers short. You very rarely thank the rep.";
-    case "mixed":
-    default:
-      return "unpredictable: some turns are neutral, some rushed, some skeptical. You generally sound a bit interrupted or wary rather than warm.";
-  }
-}
-
-function buildSimPrompt({ product, customerType, objection, difficulty, pitch, history }) {
-  const historyText = (history || [])
-    .map((m) => {
-      const speaker = m.role === "rep" ? "Rep" : "Customer";
-      return `${speaker}: ${m.text}`;
-    })
-    .join("\n");
-
-  const typeDesc = customerTypeDescriptor(customerType);
-  const diffDesc = difficultyDescriptor(difficulty);
-
-  const trainerObjection = objection && objection.trim().length > 0 ? objection.trim() : "";
-
-  return `
-You are roleplaying as a realistic homeowner answering the door to a door-to-door rep.
-
-TRAINER-SELECTED MAIN OBJECTION THEME (IF ANY):
-- Selected main objection theme: ${
-    trainerObjection ? `"${trainerObjection}"` : "(none – you must choose a primary context randomly from the weighted list below)"
-  }
-
-TONE & REALISM:
-- Customer style: ${typeDesc}
-- Resistance level: ${diffDesc}
-
-Conversation so far:
-${historyText || "(No previous conversation yet.)"}
-
-The rep's latest line is:
-Rep: ${pitch}
-
-(KEEP ALL YOUR EXISTING RULES BELOW THIS LINE — unchanged)
-`;
-}
-
-// ---------- NEW: close detection (cheap + effective) ----------
-function detectCloseType(repLine = "") {
+// Cheap close detection (good enough to break loops deterministically)
+function detectRepCloseType(repLine = "") {
   const t = repLine.toLowerCase();
 
-  // binary choice: "either/or", "A or B", "do you want X or Y"
+  const isScale = /\b1\s*[-–]\s*10\b/.test(t) || /\bout of 10\b/.test(t) || /\brate\b/.test(t);
   const isBinary =
     /\bor\b/.test(t) &&
-    (/\bdo you want\b/.test(t) ||
-      /\bwould you rather\b/.test(t) ||
-      /\bwhich\b/.test(t) ||
-      /\beither\b/.test(t));
-
-  // scale: "1-10", "out of 10", "rate it"
-  const isScale = /\b1\s*[-–]\s*10\b/.test(t) || /\bout of 10\b/.test(t) || /\brate\b/.test(t);
-
-  // permission advance: "can i show", "can we", "mind if", "real quick"
-  const isPermission =
-    /\bcan i\b/.test(t) ||
-    /\bcan we\b/.test(t) ||
-    /\bmind if\b/.test(t) ||
-    /\breal quick\b/.test(t) ||
-    /\b30 seconds\b/.test(t) ||
-    /\b15 seconds\b/.test(t);
-
-  // explicit next step ask: meter / bill / appointment language
+    (/\bdo you want\b/.test(t) || /\bwould you rather\b/.test(t) || /\beither\b/.test(t) || /\bwhich\b/.test(t));
   const isNextStep =
     /\bmeter\b/.test(t) ||
     /\bbill\b/.test(t) ||
@@ -117,6 +56,13 @@ function detectCloseType(repLine = "") {
     /\bwhat time\b/.test(t) ||
     /\btomorrow\b/.test(t) ||
     /\btoday\b/.test(t);
+  const isPermission =
+    /\bcan i\b/.test(t) ||
+    /\bcan we\b/.test(t) ||
+    /\bmind if\b/.test(t) ||
+    /\breal quick\b/.test(t) ||
+    /\b30 seconds\b/.test(t) ||
+    /\b15 seconds\b/.test(t);
 
   if (isScale) return "scale";
   if (isBinary) return "binary";
@@ -125,92 +71,85 @@ function detectCloseType(repLine = "") {
   return "none";
 }
 
-// ---------- NEW: forced decision + reply generator ----------
-function shouldForceExit({ mainMentions, latestDecision, closeType }) {
-  const looping = latestDecision === "restated_objection" || latestDecision === "still_hesitant";
-  const saturated = typeof mainMentions === "number" && mainMentions >= 3;
-  const repClosing = closeType !== "none";
-  return saturated && looping && repClosing;
+// Enforced stall-breaker: if OBJECTION_LOOP + saturated + rep closes -> force exit intent
+function shouldForceExit(simStage, flags, repPitch) {
+  const closeType = detectRepCloseType(repPitch);
+  const saturated = (flags?.objectionTurns ?? 0) >= 2; // 3rd time triggers forced exit
+  return simStage === SimStates.OBJECTION_LOOP && closeType !== "none" && saturated;
 }
 
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
+function forceExitIntentByDifficulty(difficulty = "normal") {
+  // Bias to SOFT_YES_METER. You can later add firm_no as another intent if you add it to CustomerIntent.
+  if (difficulty === "easy") return CustomerIntent.SOFT_YES_METER;
+  if (difficulty === "normal") return Math.random() < 0.8 ? CustomerIntent.SOFT_YES_METER : CustomerIntent.CLARIFYING_QUESTION;
+  if (difficulty === "tough") return Math.random() < 0.6 ? CustomerIntent.SOFT_YES_METER : CustomerIntent.CLARIFYING_QUESTION;
+  return Math.random() < 0.25 ? CustomerIntent.SOFT_YES_METER : CustomerIntent.CLARIFYING_QUESTION;
 }
 
-function forceDecision(difficulty = "normal") {
-  // Bias toward small_yes on easy/normal; more firm_no on tough/nightmare
-  if (difficulty === "easy") return "small_yes";
+function buildSystemPrompt(customerProfile, state, flags) {
+  const allowedIntents = Object.values(CustomerIntent).join(" | ");
 
-  if (difficulty === "normal") {
-    return Math.random() < 0.75 ? "small_yes" : "firm_no";
-  }
+  return `
+You are simulating a REAL HOMEOWNER for a professional sales training environment.
 
-  if (difficulty === "tough") {
-    return Math.random() < 0.55 ? "small_yes" : "firm_no";
-  }
+CRITICAL:
+- You are the HOMEOWNER. Do NOT explain AI logic.
+- Be human, realistic, and concise.
+- You MUST output ONLY valid JSON in the exact schema below.
 
-  // nightmare
-  return Math.random() < 0.25 ? "small_yes" : "firm_no";
-}
+CURRENT CUSTOMER PROFILE (summary):
+- incomeBand: ${customerProfile?.demographics?.incomeBand || "unknown"}
+- moneyStressLevel: ${customerProfile?.demographics?.moneyStressLevel ?? "unknown"}
+- riskAversion: ${customerProfile?.personality?.riskAversion ?? "unknown"}
+- trustLevel: ${customerProfile?.personality?.trustLevel ?? "unknown"}
+- toneProfile: ${customerProfile?.personality?.toneProfile || "mixed"}
 
-function generateForcedCustomerReply({ forced, category }) {
-  // Keep these short + natural. Tie to category where possible.
-  if (forced === "firm_no") {
-    return pick([
-      "No, I’m going to pass. I don’t want to deal with anything new right now.",
-      "I hear you, but no — not interested. Have a good one.",
-      "I’m not doing this right now. Thanks though.",
-    ]);
-  }
+CURRENT SIM (server-side):
+- simStage: ${state?.simStage}
+- turnCount: ${state?.turnCount}
+- trust: ${state?.trust}
+- objectionResistance: ${state?.objectionResistance}
+- clarityLevel: ${state?.clarityLevel}
+- urgencyToDecide: ${state?.urgencyToDecide}
+- confusionLevel: ${state?.confusionLevel}
 
-  // small_yes
-  switch (category) {
-    case "money/budget":
-      return pick([
-        "Alright… if it’s truly just a quick look and no signup, we can check that meter real fast.",
-        "Okay, we can look at the numbers for a minute, but I’m not committing to anything.",
-        "Fine — show me quick. If it starts sounding expensive, I’m out.",
-      ]);
-    case "trust / scams / contracts":
-      return pick([
-        "Okay, I’ll hear you out for a minute — but I’m not signing anything today.",
-        "Alright, quick look is fine. I’m still skeptical though.",
-        "We can check the basics, but I’m not agreeing to a contract right now.",
-      ]);
-    case "time / busy / hassle":
-      return pick([
-        "Make it quick — what do you need to look at?",
-        "Alright, one minute. Show me what you mean.",
-        "Okay, fast version. What’s the next step?",
-      ]);
-    case "moving timeline":
-      return pick([
-        "Okay, quick look is fine, but we might be moving soon — keep it simple.",
-        "Alright, we can check it quickly. Just be straight with me.",
-      ]);
-    case "roof condition":
-      return pick([
-        "Okay, quick look is fine — but I’m not doing anything that messes with the roof.",
-        "Alright, show me, but my roof situation is a concern.",
-      ]);
-    case "spouse/decision-maker":
-      return pick([
-        "We can look quick, but my spouse makes the final call.",
-        "Okay, show me briefly — but I’m not deciding without them.",
-      ]);
-    case "outages / reliability":
-      return pick([
-        "Alright, quick look is fine — I just care about outages and reliability.",
-        "Okay, show me. If it helps with outages, I’ll listen.",
-      ]);
-    default:
-      return pick([
-        "Alright, quick look is fine — what do you need from me?",
-        "Okay, show me quick. I’m still cautious though.",
-      ]);
+FLAGS:
+- objectionTurns: ${flags?.objectionTurns ?? 0}
+- askedForMeterCheck: ${flags?.askedForMeterCheck ?? false}
+- meterPermissionSoftYes: ${flags?.meterPermissionSoftYes ?? false}
+- appointmentSoftYes: ${flags?.appointmentSoftYes ?? false}
+- appointmentTimeProposed: ${flags?.appointmentTimeProposed ?? false}
+- appointmentConfirmed: ${flags?.appointmentConfirmed ?? false}
+
+ANTI-LOOP RULE (MANDATORY):
+- If the same concern has already been discussed multiple turns and the rep presents a clear close (binary choice, scale question, or next-step ask),
+  you must STOP repeating the same objection.
+- In that moment you MUST pick ONE realistic outcome: reluctant small yes, clear refusal, or deferral.
+
+INTENT LABEL (MANDATORY):
+You must set "customer_intent" to exactly ONE of:
+${allowedIntents}
+
+OUTPUT JSON (no extra keys):
+{
+  "customer_reply": "string",
+  "customer_intent": "${allowedIntents}",
+  "internal_reasoning": {
+    "updated_state": {
+      "trust": number,
+      "objectionResistance": number,
+      "clarityLevel": number,
+      "urgencyToDecide": number,
+      "confusionLevel": number
+    }
   }
 }
+`.trim();
+}
 
+/* ============================================================
+   API: simulate
+   ============================================================ */
 app.post("/api/simulate", async (req, res) => {
   try {
     const { product, customerType, objection, difficulty, pitch, history } = req.body;
@@ -219,108 +158,191 @@ app.post("/api/simulate", async (req, res) => {
       return res.status(400).json({ error: "Pitch is required." });
     }
 
-    // Close detection (rep line)
-    const closeType = detectCloseType(pitch);
+    // Initialize sim if needed
+    const sim = getSimState();
+    if (!sim.customerProfile || !sim.state) {
+      const profile = generateCustomerProfile();
 
-    const prompt = buildSimPrompt({
-      product,
-      customerType,
-      objection,
-      difficulty,
-      pitch,
-      history,
-    });
+      // keep your existing init, then we extend state with SimStates + flags
+      initializeSimState(profile);
+
+      const simInit = getSimState();
+      const base = simInit.state || {};
+
+      mergeSimState({
+        state: {
+          ...base,
+          simStage: SimStates.INTRO,
+          trainingConfig: {
+            product: product || null,
+            customerType: customerType || "mixed",
+            difficulty: difficulty || "normal",
+            forcedObjection: objection || null,
+          },
+          flags: {
+            objectionTurns: 0,
+            askedForMeterCheck: false,
+            meterPermissionSoftYes: false,
+            appointmentSoftYes: false,
+            appointmentTimeProposed: false,
+            appointmentConfirmed: false,
+          },
+        },
+      });
+    }
+
+    // Refresh sim after possible init
+    const sim2 = getSimState();
+    const { customerProfile } = sim2;
+    const state = sim2.state || {};
+    const flags = state.flags || {};
+
+    // Use either incoming history (front-end) or server-held conversationHistory.
+    // Prefer server-held for correctness if present.
+    const serverTranscript = (sim2.conversationHistory || [])
+      .map((t) => `${t.role === "rep" ? "Rep" : "Customer"}: ${t.message}`)
+      .join("\n");
+
+    const clientTranscript = Array.isArray(history)
+      ? history
+          .map((m) => `${m.role === "rep" ? "Rep" : "Customer"}: ${m.text}`)
+          .join("\n")
+      : "";
+
+    const transcript = serverTranscript.trim().length > 0 ? serverTranscript : clientTranscript;
+
+    // Log rep line to server-side history
+    pushConversationTurn({ role: "rep", message: pitch });
+
+    const system = buildSystemPrompt(customerProfile, state, flags);
+
+    const user = `
+Conversation so far:
+${transcript || "(none yet)"}
+
+Rep's latest line:
+Rep: ${pitch}
+`.trim();
 
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-5.1",
       messages: [
-        {
-          role: "system",
-          content: "You are an AI sales training coach and simulated homeowner. Always respond EXACTLY with valid JSON and nothing else.",
-        },
-        { role: "user", content: prompt },
+        { role: "system", content: system },
+        { role: "user", content: user },
       ],
-      temperature: 0.85,
+      temperature: 0.7,
     });
 
-    const content = completion.choices[0]?.message?.content;
-
-    let data;
+    const raw = completion.choices[0]?.message?.content || "";
+    let parsed;
     try {
-      data = JSON.parse(content);
-    } catch (err) {
-      console.error("Error parsing JSON from model:", err);
-      console.error("Raw content:", content);
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      console.error("Failed to parse model JSON:", raw);
       return res.status(500).json({ error: "Failed to parse AI response." });
     }
 
-    let { customer_reply, scores, tips, state } = data;
+    let customer_reply = parsed.customer_reply || "";
+    let customer_intent = parsed.customer_intent || CustomerIntent.NEW_OBJECTION;
 
-    // ---------- NEW: server-enforced stall breaker ----------
-    const mainMentions = state?.main_objection_mentions ?? 0;
-    const latestDecision = state?.latest_decision ?? "still_hesitant";
-    const category = state?.main_objection_category ?? "money/budget";
-
-    if (shouldForceExit({ mainMentions, latestDecision, closeType })) {
-      const forced = forceDecision(difficulty);
-
-      // Force the sim to exit the loop in a human way.
-      customer_reply = generateForcedCustomerReply({ forced, category });
-
-      // Keep your state consistent with forced outcome
-      state = {
-        ...state,
-        latest_decision: forced,
-        micro_commitment_taken: forced === "small_yes" ? true : state?.micro_commitment_taken ?? false,
-        appointment_committed: forced === "firm_yes" ? true : state?.appointment_committed ?? false,
-      };
-
-      // Nudge scoring to reflect “your line succeeded at breaking the loop”
-      scores = {
-        ...(scores || {}),
-        objection_handling: Math.max(scores?.objection_handling ?? 7, 7),
-        overall: Math.max(scores?.overall ?? 7, 7),
-      };
-
-      // Tips now shift to “advance the process” instead of re-answering
-      tips = [
-        "Confirm the small yes, then give the next micro-step.",
-        "Ask one tight qualifier question, then move forward.",
-        "Offer two appointment windows and stay silent.",
-      ];
+    // Enforce allowed intents
+    const allowed = new Set(Object.values(CustomerIntent));
+    if (!allowed.has(customer_intent)) {
+      customer_intent = CustomerIntent.NEW_OBJECTION;
     }
 
+    // Stall breaker (server-enforced)
+    if (shouldForceExit(state.simStage, flags, pitch)) {
+      const forced = forceExitIntentByDifficulty(state.trainingConfig?.difficulty || "normal");
+      customer_intent = forced;
+
+      if (forced === CustomerIntent.SOFT_YES_METER) {
+        customer_reply =
+          "Alright… if it’s truly just a quick look and I’m not signing anything, we can check it real quick.";
+      } else if (forced === CustomerIntent.CLARIFYING_QUESTION) {
+        customer_reply =
+          "Okay—before we go further, what exactly are you needing from me, and is there any cost or contract today?";
+      }
+    }
+
+    // Update continuous state (server-side)
+    const updated = parsed?.internal_reasoning?.updated_state;
+    if (updated) {
+      mergeSimState({
+        state: {
+          trust: clamp01(updated.trust),
+          objectionResistance: clamp01(updated.objectionResistance),
+          clarityLevel: clamp01(updated.clarityLevel),
+          urgencyToDecide: clamp01(updated.urgencyToDecide),
+          confusionLevel: clamp01(updated.confusionLevel),
+        },
+      });
+    }
+
+    // Run SimStates transition (source of truth)
+    const sim3 = getSimState();
+    const currentStage = sim3.state.simStage || SimStates.INTRO;
+    const currentFlags = sim3.state.flags || flags;
+
+    const nextStage = runStateMachine(currentStage, currentFlags, customer_intent);
+
+    // Persist stage + flags (flags is mutated by stateMachine)
+    mergeSimState({
+      state: {
+        simStage: nextStage,
+        flags: currentFlags,
+      },
+    });
+
+    // Log customer reply
+    pushConversationTurn({ role: "customer", message: customer_reply });
+
+    const sim4 = getSimState();
     return res.json({
       reply: customer_reply,
-      score: scores,
-      tips,
-      state,
+      customer_intent,
+      simStage: sim4.state.simStage,
+      flags: sim4.state.flags,
+      internal: {
+        trust: sim4.state.trust,
+        objectionResistance: sim4.state.objectionResistance,
+        clarityLevel: sim4.state.clarityLevel,
+        urgencyToDecide: sim4.state.urgencyToDecide,
+        confusionLevel: sim4.state.confusionLevel,
+      },
     });
-  } catch (error) {
-    console.error("Error in /api/simulate:", error);
+  } catch (err) {
+    console.error("Error in /api/simulate:", err);
     return res.status(500).json({ error: "Something went wrong." });
   }
 });
 
-// Hint endpoint unchanged (your existing code)
+/* ============================================================
+   API: hint (kept, but made compatible with new state/flags)
+   ============================================================ */
 app.post("/api/hint", async (req, res) => {
-  const { simState, flags, transcript } = req.body;
-
   try {
-    const prompt = `
-You are a sales coach for a solar/battery door-to-door rep.
+    const sim = getSimState();
+    const simStage = sim?.state?.simStage || "UNKNOWN";
+    const flags = sim?.state?.flags || {};
+    const transcript = (sim?.conversationHistory || [])
+      .map((t) => `${t.role === "rep" ? "Rep" : "Customer"}: ${t.message}`)
+      .join("\n");
 
-Current simulation state: ${simState}
+    const prompt = `
+You are a sales coach for a door-to-door rep.
+
+Current simStage: ${simStage}
 Flags: ${JSON.stringify(flags, null, 2)}
 
 Transcript so far (most recent at the bottom):
-${transcript}
+${transcript || "(none)"}
 
 Give the rep:
-1) A short coaching focus for this state (1–2 sentences).
-2) A suggested structure for the next sentence or two they could say (not a full script, just a push in the right direction).
+1) A short coaching focus for this stage (1–2 sentences).
+2) A suggested structure for the next sentence or two (not a full script).
 Keep it under 120 words total.
-`;
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-5.1",
@@ -331,12 +353,20 @@ Keep it under 120 words total.
       temperature: 0.4,
     });
 
-    const hintText = completion.choices[0].message.content;
-    res.json({ hint: hintText });
+    const hintText = completion.choices[0]?.message?.content || "";
+    return res.json({ hint: hintText });
   } catch (err) {
     console.error("Error in /api/hint:", err);
-    res.status(500).json({ error: "Failed to generate hint" });
+    return res.status(500).json({ error: "Failed to generate hint" });
   }
+});
+
+/* ============================================================
+   API: reset sim
+   ============================================================ */
+app.post("/api/reset-sim", (req, res) => {
+  resetSimState();
+  return res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
