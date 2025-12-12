@@ -1,23 +1,48 @@
 // src/App.jsx
-import React, {
-  useState,
-  useEffect,
-  useRef,
-  useCallback,
-} from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE || "http://localhost:5000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
 
 const isMobile =
   typeof navigator !== "undefined" &&
-  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-    navigator.userAgent
-  );
-
+  /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
 console.log("API_BASE in browser:", API_BASE);
-  
+
+// -----------------------------
+// Session (per device) helpers
+// -----------------------------
+const SESSION_KEY = "sim_session_id";
+
+function createSessionId() {
+  // crypto.randomUUID is widely supported in modern browsers
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  // Fallback
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getOrCreateSessionId() {
+  try {
+    let id = localStorage.getItem(SESSION_KEY);
+    if (!id) {
+      id = createSessionId();
+      localStorage.setItem(SESSION_KEY, id);
+    }
+    return id;
+  } catch {
+    // If localStorage blocked, fall back to an in-memory id per tab load
+    return createSessionId();
+  }
+}
+
+function setSessionId(id) {
+  try {
+    localStorage.setItem(SESSION_KEY, id);
+  } catch {
+    // ignore
+  }
+}
+
 function App() {
   const [conversation, setConversation] = useState([]);
   const [input, setInput] = useState("");
@@ -42,6 +67,15 @@ function App() {
   const [ttsReady, setTtsReady] = useState(false);
   const recognitionRef = useRef(null);
 
+  // Hold sessionId in React state so it can be rotated on restart
+  const [sessionId, setSessionIdState] = useState(() => getOrCreateSessionId());
+
+  const sessionHeaders = useMemo(() => {
+    return {
+      "Content-Type": "application/json",
+      "x-sim-session-id": sessionId,
+    };
+  }, [sessionId]);
 
   // ---- helper: build history payload for /api/simulate ----
   const buildHistory = useCallback(() => {
@@ -51,71 +85,81 @@ function App() {
   }, [conversation]);
 
   // ---- helper: send line to backend (rep -> customer) ----
- const sendToBackend = useCallback(
-  async (repLine) => {
-    setLoading(true);
-    try {
-      const history = buildHistory();
+  const sendToBackend = useCallback(
+    async (repLine) => {
+      setLoading(true);
+      try {
+        const history = buildHistory();
 
-      // Build conversation array for the backend that expects it
-      // We take the existing history and append the current rep line
-      const conversationPayload = [
-        ...history,
-        { role: "rep", text: repLine },
-      ];
+        // Some backends expect both `history` and `conversation`; keep both for compatibility
+        const conversationPayload = [...history, { role: "rep", text: repLine }];
 
-      const res = await fetch(`${API_BASE}/api/simulate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          product: "solar + battery program",
-          customerType: "mixed",
-          objection: "",
-          difficulty: "normal",
-          pitch: repLine,
-          history,              // for the new prompt builder
-          conversation: conversationPayload, // for the old backend expectation
-        }),
-      });
+        const res = await fetch(`${API_BASE}/api/simulate`, {
+          method: "POST",
+          headers: sessionHeaders,
+          body: JSON.stringify({
+            product: "solar + battery program",
+            customerType: "mixed",
+            objection: "",
+            difficulty: "normal",
+            pitch: repLine,
+            history, // newer format
+            conversation: conversationPayload, // older format
+          }),
+        });
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || "Failed to get sim response");
+        // If API accidentally returns HTML, surface it clearly
+        const ct = res.headers.get("content-type") || "";
+        if (!ct.includes("application/json")) {
+          const text = await res.text().catch(() => "");
+          throw new Error(
+            `API returned non-JSON (content-type: ${ct}). Likely a routing/base-URL issue. Snippet: ${text.slice(
+              0,
+              120
+            )}`
+          );
+        }
+
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || "Failed to get sim response");
+        }
+
+        const data = await res.json();
+
+        // Backward/forward compatible fields
+        const reply = data.reply ?? data.customer_reply ?? data.customerReply ?? "";
+        const scores = data.score ?? data.scores ?? null;
+        const tips = data.tips ?? null;
+        const state = data.state ?? null;
+
+        // append customer reply
+        setConversation((prev) => [...prev, { role: "customer", text: reply }]);
+
+        setDecision(state?.latest_decision || null);
+        setDebugState(state || null);
+        setScore(scores || null);
+        setCoachTips(tips || null);
+
+        if (autoSpeak && ttsReady && "speechSynthesis" in window && reply) {
+          try {
+            const utter = new SpeechSynthesisUtterance(reply);
+            utter.rate = 1;
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(utter);
+          } catch (e) {
+            console.error("TTS speak failed:", e);
+          }
+        }
+      } catch (err) {
+        console.error("Error in /api/simulate:", err);
+        setError(err.message || "Error talking to simulator");
+      } finally {
+        setLoading(false);
       }
-
-      const data = await res.json();
-      const { reply, score: scores, tips, state } = data;
-
-      // append customer reply
-      setConversation((prev) => [
-        ...prev,
-        { role: "customer", text: reply },
-      ]);
-
-      setDecision(state?.latest_decision || null);
-      setDebugState(state || null);
-      setScore(scores || null);
-      setCoachTips(tips || null);
-
-  if (autoSpeak && ttsReady && "speechSynthesis" in window) {
-    try {
-      const utter = new SpeechSynthesisUtterance(reply);
-      utter.rate = 1;
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(utter);
-    } catch (e) {
-      console.error("TTS speak failed:", e);
-    }
-  }
-} catch (err) {
-  console.error("Error in /api/simulate:", err);
-  setError(err.message || "Error talking to simulator");
-} finally {
-  setLoading(false);
-}
-  },
-  [autoSpeak, buildHistory, ttsReady]
-);
+    },
+    [API_BASE, autoSpeak, buildHistory, sessionHeaders, ttsReady]
+  );
 
   // ---- helper: handle send (text OR STT transcript) ----
   const handleSend = useCallback(
@@ -132,32 +176,29 @@ function App() {
       setError(null);
       setHint(""); // clear previous hint when you take action
 
-      // add rep line
-      setConversation((prev) => [
-        ...prev,
-        { role: "rep", text: content },
-      ]);
+      // add rep line locally
+      setConversation((prev) => [...prev, { role: "rep", text: content }]);
 
       await sendToBackend(content);
     },
     [input, loading, simStarted, sendToBackend]
   );
 
-  // ---- start sim on mount (local only, stateless backend) ----
+  // ---- start sim on mount ----
   useEffect(() => {
     setSimStarted(true);
     setConversation([
       {
         role: "system",
-        text: "Simulation started. New homeowner, fresh objections. Practice your opener and work to a small yes or appointment.",
+        text:
+          "Simulation started. New homeowner, fresh objections. Practice your opener and work to a small yes or appointment.",
       },
     ]);
   }, []);
 
-  // ---- init STT once, using handleSend as dependency ----
+  // ---- init STT once ----
   useEffect(() => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       setSttSupported(false);
@@ -181,7 +222,6 @@ function App() {
     recognition.onresult = (event) => {
       const transcript = event.results[0][0].transcript.trim();
       if (transcript) {
-        // push transcript through same path
         handleSend(transcript);
       }
     };
@@ -204,9 +244,8 @@ function App() {
   };
 
   const toggleListening = () => {
-    if (!sttSupported || !recognitionRef.current || loading || !simStarted) {
-      return;
-    }
+    if (!sttSupported || !recognitionRef.current || loading || !simStarted) return;
+
     if (isListening) {
       recognitionRef.current.stop();
     } else {
@@ -215,7 +254,29 @@ function App() {
     }
   };
 
-  const handleRestart = () => {
+  // ---- Restart: new sessionId (so phone/desktop never collide) + reset server session ----
+  const handleRestart = async () => {
+    // Generate a brand-new session id (clean slate)
+    const next = createSessionId();
+    setSessionId(next);
+    setSessionIdState(next);
+
+    // Reset server sim for this new session (best effort)
+    try {
+      await fetch(`${API_BASE}/api/reset-sim`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-sim-session-id": next,
+        },
+        body: JSON.stringify({}),
+      });
+    } catch (e) {
+      // not fatal; sim will initialize on first /api/simulate
+      console.warn("reset-sim failed (non-fatal):", e);
+    }
+
+    // Reset UI
     setConversation([
       {
         role: "system",
@@ -248,9 +309,7 @@ function App() {
     try {
       const transcript = conversation
         .filter((m) => m.role !== "system")
-        .map((m) =>
-          `${m.role === "rep" ? "You" : "Customer"}: ${m.text}`
-        )
+        .map((m) => `${m.role === "rep" ? "You" : "Customer"}: ${m.text}`)
         .join("\n");
 
       const simState = debugState?.latest_decision || "in_play";
@@ -258,13 +317,19 @@ function App() {
 
       const res = await fetch(`${API_BASE}/api/hint`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: sessionHeaders,
         body: JSON.stringify({
           simState,
           flags,
           transcript,
         }),
       });
+
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Hint API returned non-JSON (content-type: ${ct}). Snippet: ${text.slice(0, 120)}`);
+      }
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -304,16 +369,8 @@ function App() {
         }}
       >
         <div>
-          <h1 style={{ fontSize: "1.5rem", margin: 0 }}>
-            AI Sales Trainer · MVP
-          </h1>
-          <p
-            style={{
-              fontSize: "0.9rem",
-              marginTop: "0.25rem",
-              color: "#9ca3af",
-            }}
-          >
+          <h1 style={{ fontSize: "1.5rem", margin: 0 }}>AI Sales Trainer · MVP</h1>
+          <p style={{ fontSize: "0.9rem", marginTop: "0.25rem", color: "#9ca3af" }}>
             Practice live objections with voice · You vs Customer
           </p>
         </div>
@@ -397,11 +454,7 @@ function App() {
                 key={idx}
                 style={{
                   alignSelf:
-                    turn.role === "rep"
-                      ? "flex-start"
-                      : turn.role === "customer"
-                      ? "flex-end"
-                      : "center",
+                    turn.role === "rep" ? "flex-start" : turn.role === "customer" ? "flex-end" : "center",
                   maxWidth: "80%",
                   fontSize: "0.9rem",
                 }}
@@ -415,18 +468,9 @@ function App() {
                         : turn.role === "customer"
                         ? "0.75rem 0.75rem 0 0.75rem"
                         : "0.5rem",
-                    backgroundColor:
-                      turn.role === "rep"
-                        ? "#1d4ed8"
-                        : turn.role === "customer"
-                        ? "#111827"
-                        : "transparent",
-                    border:
-                      turn.role === "system" ? "1px dashed #4b5563" : "none",
-                    color:
-                      turn.role === "rep" || turn.role === "customer"
-                        ? "#e5e7eb"
-                        : "#9ca3af",
+                    backgroundColor: turn.role === "rep" ? "#1d4ed8" : turn.role === "customer" ? "#111827" : "transparent",
+                    border: turn.role === "system" ? "1px dashed #4b5563" : "none",
+                    color: turn.role === "rep" || turn.role === "customer" ? "#e5e7eb" : "#9ca3af",
                   }}
                 >
                   {turn.role !== "system" && (
@@ -458,22 +502,12 @@ function App() {
               alignItems: "center",
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                gap: "0.5rem",
-                alignItems: "flex-end",
-              }}
-            >
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end" }}>
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={
-                  simStarted
-                    ? "Type your line or use the mic button..."
-                    : "Starting simulation..."
-                }
+                placeholder={simStarted ? "Type your line or use the mic button..." : "Starting simulation..."}
                 disabled={!simStarted || loading}
                 style={{
                   flex: 1,
@@ -500,14 +534,8 @@ function App() {
                   color: "#020617",
                   fontWeight: 600,
                   fontSize: "0.9rem",
-                  cursor:
-                    !simStarted || loading || !input.trim()
-                      ? "not-allowed"
-                      : "pointer",
-                  opacity:
-                    !simStarted || loading || !input.trim()
-                      ? 0.6
-                      : 1,
+                  cursor: !simStarted || loading || !input.trim() ? "not-allowed" : "pointer",
+                  opacity: !simStarted || loading || !input.trim() ? 0.6 : 1,
                   whiteSpace: "nowrap",
                 }}
               >
@@ -515,14 +543,7 @@ function App() {
               </button>
             </div>
 
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: "0.35rem",
-              }}
-            >
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.35rem" }}>
               <button
                 onClick={toggleListening}
                 disabled={!sttSupported || !simStarted || loading}
@@ -531,36 +552,19 @@ function App() {
                   height: "72px",
                   borderRadius: "999px",
                   border: "none",
-                  backgroundColor: !sttSupported
-                    ? "#374151"
-                    : isListening
-                    ? "#ef4444"
-                    : "#eab308",
+                  backgroundColor: !sttSupported ? "#374151" : isListening ? "#ef4444" : "#eab308",
                   color: "#020617",
                   fontWeight: 700,
                   fontSize: "0.75rem",
-                  cursor:
-                    !sttSupported || !simStarted || loading
-                      ? "not-allowed"
-                      : "pointer",
-                  boxShadow: isListening
-                    ? "0 0 0 4px rgba(239,68,68,0.4)"
-                    : "0 0 0 2px rgba(234,179,8,0.3)",
+                  cursor: !sttSupported || !simStarted || loading ? "not-allowed" : "pointer",
+                  boxShadow: isListening ? "0 0 0 4px rgba(239,68,68,0.4)" : "0 0 0 2px rgba(234,179,8,0.3)",
                   transition: "transform 0.1s ease, box-shadow 0.1s ease",
                 }}
               >
-                {sttSupported
-                  ? isListening
-                    ? "Listening"
-                    : "Talk"
-                  : "No Mic"}
+                {sttSupported ? (isListening ? "Listening" : "Talk") : "No Mic"}
               </button>
               <div style={{ fontSize: "0.7rem", color: "#9ca3af" }}>
-                {sttSupported
-                  ? isListening
-                    ? "Speak your line…"
-                    : "Tap to speak"
-                  : "Browser doesn't support STT"}
+                {sttSupported ? (isListening ? "Speak your line…" : "Tap to speak") : "Browser doesn't support STT"}
               </div>
             </div>
           </div>
@@ -578,14 +582,11 @@ function App() {
             gap: "0.75rem",
           }}
         >
-          <h2 style={{ fontSize: "1rem", margin: 0, marginBottom: "0.5rem" }}>
-            Scorecard / Sim State
-          </h2>
+          <h2 style={{ fontSize: "1rem", margin: 0, marginBottom: "0.5rem" }}>Scorecard / Sim State</h2>
 
           <div style={{ fontSize: "0.85rem", color: "#9ca3af" }}>
             <div style={{ marginBottom: "0.25rem" }}>
-              <strong>Last decision:</strong>{" "}
-              <span style={{ color: "#e5e7eb" }}>{decision || "—"}</span>
+              <strong>Last decision:</strong> <span style={{ color: "#e5e7eb" }}>{decision || "—"}</span>
             </div>
 
             {score && (
@@ -600,69 +601,61 @@ function App() {
               >
                 <div>
                   <div style={{ color: "#9ca3af" }}>Cadence</div>
-                  <div style={{ color: "#e5e7eb" }}>
-                    {score.cadence ?? "—"}/10
-                  </div>
+                  <div style={{ color: "#e5e7eb" }}>{score.cadence ?? "—"}/10</div>
                 </div>
                 <div>
                   <div style={{ color: "#9ca3af" }}>Clarity</div>
-                  <div style={{ color: "#e5e7eb" }}>
-                    {score.clarity ?? "—"}/10
-                  </div>
+                  <div style={{ color: "#e5e7eb" }}>{score.clarity ?? "—"}/10</div>
                 </div>
                 <div>
                   <div style={{ color: "#9ca3af" }}>Objection Handling</div>
-                  <div style={{ color: "#e5e7eb" }}>
-                    {score.objection_handling ?? "—"}/10
-                  </div>
+                  <div style={{ color: "#e5e7eb" }}>{score.objection_handling ?? "—"}/10</div>
                 </div>
                 <div>
                   <div style={{ color: "#9ca3af" }}>Overall</div>
-                  <div style={{ color: "#e5e7eb" }}>
-                    {score.overall ?? "—"}/10
-                  </div>
+                  <div style={{ color: "#e5e7eb" }}>{score.overall ?? "—"}/10</div>
                 </div>
               </div>
             )}
 
-<button
-  type="button"
-  onClick={() => {
-    if (!("speechSynthesis" in window)) {
-      alert("Your browser does not support text-to-speech.");
-      return;
-    }
+            <button
+              type="button"
+              onClick={() => {
+                if (!("speechSynthesis" in window)) {
+                  alert("Your browser does not support text-to-speech.");
+                  return;
+                }
 
-    try {
-      const testUtterance = new SpeechSynthesisUtterance(
-        "Voice has been enabled for your sales trainer."
-      );
-      testUtterance.rate = 1;
+                try {
+                  const testUtterance = new SpeechSynthesisUtterance(
+                    "Voice has been enabled for your sales trainer."
+                  );
+                  testUtterance.rate = 1;
 
-      testUtterance.onend = () => {
-        setTtsReady(true);
-        console.log("TTS warmed up and ready.");
-      };
+                  testUtterance.onend = () => {
+                    setTtsReady(true);
+                    console.log("TTS warmed up and ready.");
+                  };
 
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(testUtterance);
-    } catch (err) {
-      console.error("TTS warmup failed:", err);
-    }
-  }}
-  style={{
-    marginTop: "0.4rem",
-    padding: "0.25rem 0.6rem",
-    borderRadius: "0.375rem",
-    border: "1px solid #4b5563",
-    backgroundColor: "#111827",
-    color: "#e5e7eb",
-    fontSize: "0.75rem",
-    cursor: "pointer",
-  }}
->
-  {ttsReady ? "Voice ready" : "Tap to enable voice"}
-</button>
+                  window.speechSynthesis.cancel();
+                  window.speechSynthesis.speak(testUtterance);
+                } catch (err) {
+                  console.error("TTS warmup failed:", err);
+                }
+              }}
+              style={{
+                marginTop: "0.4rem",
+                padding: "0.25rem 0.6rem",
+                borderRadius: "0.375rem",
+                border: "1px solid #4b5563",
+                backgroundColor: "#111827",
+                color: "#e5e7eb",
+                fontSize: "0.75rem",
+                cursor: "pointer",
+              }}
+            >
+              {ttsReady ? "Voice ready" : "Tap to enable voice"}
+            </button>
 
             {coachTips && coachTips.length > 0 && (
               <div
@@ -674,22 +667,10 @@ function App() {
                   border: "1px solid #111827",
                 }}
               >
-                <div
-                  style={{
-                    marginBottom: "0.25rem",
-                    fontWeight: 600,
-                    color: "#e5e7eb",
-                  }}
-                >
+                <div style={{ marginBottom: "0.25rem", fontWeight: 600, color: "#e5e7eb" }}>
                   Coaching tips (next line)
                 </div>
-                <ul
-                  style={{
-                    paddingLeft: "1.1rem",
-                    margin: 0,
-                    fontSize: "0.8rem",
-                  }}
-                >
+                <ul style={{ paddingLeft: "1.1rem", margin: 0, fontSize: "0.8rem" }}>
                   {coachTips.map((tip, idx) => (
                     <li key={idx}>{tip}</li>
                   ))}
@@ -709,14 +690,7 @@ function App() {
                 gap: "0.4rem",
               }}
             >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: "0.5rem",
-                }}
-              >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem" }}>
                 <span
                   style={{
                     fontSize: "0.8rem",
@@ -737,21 +711,14 @@ function App() {
                     backgroundColor: "#111827",
                     color: "#e5e7eb",
                     fontSize: "0.75rem",
-                    cursor:
-                      hintLoading || !simStarted ? "not-allowed" : "pointer",
+                    cursor: hintLoading || !simStarted ? "not-allowed" : "pointer",
                     opacity: hintLoading || !simStarted ? 0.6 : 1,
                   }}
                 >
                   {hintLoading ? "Thinking..." : "Hint / Coach Me"}
                 </button>
               </div>
-              <div
-                style={{
-                  fontSize: "0.8rem",
-                  color: hint ? "#e5e7eb" : "#6b7280",
-                  whiteSpace: "pre-wrap",
-                }}
-              >
+              <div style={{ fontSize: "0.8rem", color: hint ? "#e5e7eb" : "#6b7280", whiteSpace: "pre-wrap" }}>
                 {hint || "Hit the button if you feel stuck on your next line."}
               </div>
             </div>
@@ -770,9 +737,7 @@ function App() {
                     "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
                 }}
               >
-                <div style={{ marginBottom: "0.25rem", fontWeight: 600 }}>
-                  Internal State (debug)
-                </div>
+                <div style={{ marginBottom: "0.25rem", fontWeight: 600 }}>Internal State (debug)</div>
                 <pre
                   style={{
                     margin: 0,
@@ -785,12 +750,17 @@ function App() {
                 </pre>
               </div>
             )}
+
             {!debugState && (
               <div style={{ marginTop: "0.5rem" }}>
-                No internal state yet — send a line to see how the customer’s
-                context and decisions evolve.
+                No internal state yet — send a line to see how the customer’s context and decisions evolve.
               </div>
             )}
+          </div>
+
+          {/* Tiny optional footer: helpful for verifying per-device session separation */}
+          <div style={{ marginTop: "0.75rem", fontSize: "0.7rem", color: "#6b7280" }}>
+            Session: {sessionId.slice(0, 8)}…
           </div>
         </section>
       </main>

@@ -1,126 +1,220 @@
 // server/sim/simState.js
-// Holds internal simulation state (server-side).
+// Per-session simulation state store.
+// Fixes cross-device “shared conversation” by isolating state by sessionId.
+//
+// Backward compatible:
+// - If a caller omits sessionId, we default to "default".
 
-import { SimStates } from "./stateMachine.js";
+function freshSim() {
+  return {
+    customerProfile: null,
+    state: null,
+    flags: null,
+    conversationHistory: [],
+    _meta: {
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    },
+  };
+}
 
-let simState = {
-  customerProfile: null,
-  state: null,
-  flags: null,
-  conversationHistory: [],
-};
+// sessionId -> sim
+const store = new Map();
+
+// Basic TTL cleanup (optional but helpful on long-running instances)
+const MAX_SESSIONS = 500;
+const SESSION_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+
+function normalizeSessionId(sessionId) {
+  if (typeof sessionId === "string" && sessionId.trim()) return sessionId.trim();
+  return "default";
+}
+
+function touch(sim) {
+  sim._meta.updatedAt = Date.now();
+}
+
+function cleanupIfNeeded() {
+  // prune old sessions by TTL, then cap size
+  const now = Date.now();
+
+  for (const [sid, sim] of store.entries()) {
+    const last = sim?._meta?.updatedAt ?? sim?._meta?.createdAt ?? now;
+    if (now - last > SESSION_TTL_MS) {
+      store.delete(sid);
+    }
+  }
+
+  if (store.size <= MAX_SESSIONS) return;
+
+  // If still too big, remove oldest updated
+  const entries = Array.from(store.entries()).sort((a, b) => {
+    const au = a[1]?._meta?.updatedAt ?? 0;
+    const bu = b[1]?._meta?.updatedAt ?? 0;
+    return au - bu;
+  });
+
+  const excess = store.size - MAX_SESSIONS;
+  for (let i = 0; i < excess; i++) {
+    store.delete(entries[i][0]);
+  }
+}
 
 /* ============================================================
-   Initialize the simulation with customer profile + base state
+   Get sim state (per session)
    ============================================================ */
-export function initializeSimState(customerProfile, trainingConfig = {}) {
-  simState.customerProfile = customerProfile;
+export function getSimState(sessionId) {
+  const sid = normalizeSessionId(sessionId);
+  if (!store.has(sid)) {
+    store.set(sid, freshSim());
+  }
+  const sim = store.get(sid);
+  touch(sim);
+  cleanupIfNeeded();
+  return sim;
+}
 
-  simState.state = {
-    // High-level state-machine stage (the real “where are we?”)
-    simStage: SimStates.INTRO,
+/* ============================================================
+   Initialize sim (per session)
+   ============================================================ */
+export function initializeSimState(sessionIdOrProfile, maybeProfile, maybeTrainingConfig = {}) {
+  // Support both call styles:
+  // initializeSimState(profile)
+  // initializeSimState(sessionId, profile, trainingConfig)
+  let sessionId = "default";
+  let customerProfile = sessionIdOrProfile;
+  let trainingConfig = maybeTrainingConfig;
 
-    // Training config / knobs
-    trainingConfig: {
-      difficulty: trainingConfig.difficulty || "normal",
-      customerType: trainingConfig.customerType || "mixed",
-      forcedObjection: trainingConfig.objection || null,
-      product: trainingConfig.product || null,
-    },
+  if (typeof sessionIdOrProfile === "string") {
+    sessionId = normalizeSessionId(sessionIdOrProfile);
+    customerProfile = maybeProfile;
+    trainingConfig = maybeTrainingConfig || {};
+  }
 
-    // Internal continuous variables (0–1)
+  const sim = getSimState(sessionId);
+
+  sim.customerProfile = customerProfile;
+
+  // If your new SimStates machine needs different structure,
+  // you can extend this safely; this file’s job is storage isolation.
+  sim.state = {
     turnCount: 0,
-    trust: 0.25,
+
+    // Emotional + Logical Factors
+    trust: 0.25, // 0–1
     objectionResistance: 0.0,
     clarityLevel: 0.5,
     urgencyToDecide: 0.1,
     confusionLevel: 0.3,
 
-    // Persistence tracking
+    // Key Sales Variables
+    interestInProgram: 0.1,
+    fearOfCostIncrease: 0.7,
+    perceptionOfRisk: customerProfile?.personality?.riskAversion ?? 0.5,
+    objectionRepeats: 0,
+    objectionType: null,
+
+    // Decision Gates
+    readyForMeterCheck: false,
+    readyForAppointment: false,
+
+    // Track last objection
     lastObjection: null,
+
+    // Optional: training config passthrough
+    trainingConfig: trainingConfig || {},
   };
 
-  // Discrete flags used by the SimStates transitions
-  simState.flags = {
+  // Optional flags for state-machine-driven sims
+  sim.flags = sim.flags || {
     objectionTurns: 0,
-
     askedForMeterCheck: false,
     meterPermissionSoftYes: false,
-
     appointmentSoftYes: false,
     appointmentTimeProposed: false,
     appointmentConfirmed: false,
   };
 
-  simState.conversationHistory = [];
+  sim.conversationHistory = [];
+  touch(sim);
 }
 
 /* ============================================================
-   Get full simulation state
+   Update internal state (merged, not replaced)
    ============================================================ */
-export function getSimState() {
-  return simState;
-}
+export function updateSimState(sessionIdOrUpdate, maybeUpdate) {
+  // Support both call styles:
+  // updateSimState({ state: {...} })
+  // updateSimState(sessionId, { state: {...} })
+  let sessionId = "default";
+  let update = sessionIdOrUpdate;
 
-export function updateSimState(patch = {}) {
-  if (!simState.state) simState.state = {};
+  if (typeof sessionIdOrUpdate === "string") {
+    sessionId = normalizeSessionId(sessionIdOrUpdate);
+    update = maybeUpdate;
+  }
 
-  // Support both shapes:
-  // updateSimState({ trust: 0.4 })
-  // updateSimState({ state: { trust: 0.4 } })
-  const next = patch.state && typeof patch.state === "object" ? patch.state : patch;
+  const sim = getSimState(sessionId);
+  if (!sim.state) sim.state = {};
 
-  simState.state = {
-    ...simState.state,
-    ...next,
-  };
-}
+  if (update && update.state && typeof update.state === "object") {
+    sim.state = {
+      ...sim.state,
+      ...update.state,
+    };
+  } else if (update && typeof update === "object") {
+    // Allow direct merge: updateSimState({ trust: 0.4 })
+    sim.state = {
+      ...sim.state,
+      ...update,
+    };
+  }
 
-/* ============================================================
-   Merge update into internal state
-   ============================================================ */
-export function mergeSimInternalState(partial) {
-  if (!partial) return;
-  simState.state = {
-    ...simState.state,
-    ...partial,
-  };
-}
+  if (update && update.flags && typeof update.flags === "object") {
+    sim.flags = {
+      ...(sim.flags || {}),
+      ...update.flags,
+    };
+  }
 
-/* ============================================================
-   Merge flags update (optional)
-   ============================================================ */
-export function mergeFlags(partialFlags) {
-  if (!partialFlags) return;
-  simState.flags = {
-    ...simState.flags,
-    ...partialFlags,
-  };
+  touch(sim);
 }
 
 /* ============================================================
    Log a conversation turn
    ============================================================ */
-export function pushConversationTurn(turn) {
-  simState.conversationHistory.push({
-    role: turn.role, // "rep" | "customer"
+export function pushConversationTurn(sessionIdOrTurn, maybeTurn) {
+  // Support both call styles:
+  // pushConversationTurn(turn)
+  // pushConversationTurn(sessionId, turn)
+  let sessionId = "default";
+  let turn = sessionIdOrTurn;
+
+  if (typeof sessionIdOrTurn === "string") {
+    sessionId = normalizeSessionId(sessionIdOrTurn);
+    turn = maybeTurn;
+  }
+
+  const sim = getSimState(sessionId);
+
+  sim.conversationHistory.push({
+    role: turn.role,
     message: turn.message,
     timestamp: Date.now(),
   });
 
-  if (turn.role === "customer") {
-    simState.state.turnCount += 1;
+  if (turn.role === "customer" && sim.state) {
+    sim.state.turnCount = (sim.state.turnCount || 0) + 1;
   }
+
+  touch(sim);
 }
 
 /* ============================================================
-   Reset simulation
+   Reset sim (per session)
    ============================================================ */
-export function resetSimState() {
-  simState = {
-    customerProfile: null,
-    state: null,
-    flags: null,
-    conversationHistory: [],
-  };
+export function resetSimState(sessionId) {
+  const sid = normalizeSessionId(sessionId);
+  store.set(sid, freshSim());
+  cleanupIfNeeded();
 }
